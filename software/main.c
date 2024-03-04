@@ -182,8 +182,13 @@ static const uint8_t uiTimeoutCount = 4;
 /* Startup delay before beginning to service commands */
 static const uint16_t uiStartupDelayMs = 300;
 
+#ifdef ENABLE_EEPROM
 /* How often to update time in EEPROM */
-static const uint32_t uiSaveClockEverySecs = 60;
+static const uint8_t uiSaveClockEverySecs = 60;
+
+/* Timeout between last write and EEPROM commit */
+static const uint8_t uiWriteTimeoutSecs = 3;
+#endif
 
 /* Macros */
 
@@ -245,7 +250,9 @@ static void powerSaveInit(void);
 static void gpioInit(void);
 static void usiInit(void);
 static void timerInit(void);
+#ifdef ENABLE_EEPROM
 static uint32_t snapshotSeconds(void);
+#endif
 static uint8_t processRegularCmdRead(uint8_t uiAddrBase);
 static void processRegularCmdWrite(uint8_t uiAddrBase, uint8_t uiData);
 static uint8_t processExtendedCmdRead(uint8_t uiAddrBase, uint8_t uiAddrExt);
@@ -261,6 +268,9 @@ static uint8_t abyPRAM[PRAM_SIZE] = {0x00};
 __attribute__((section(".eeprom")))
 static uint32_t uiStoredSeconds = 0;
 
+/* Free running seconds counter 8-bit for timeouts */
+static volatile uint8_t uiSeconds;
+
 #endif
 
 /* PRAM shadow buffer (working copy of EEPROM data in RAM) */
@@ -268,18 +278,19 @@ static uint8_t abyPRAMShadow[PRAM_SIZE];
 
 #ifdef ENABLE_EEPROM
 
-/*
-** Dirty flag - Set when PRAM shadow write protection applied. Ideally this would
-** only be set if a value was written, however this way we get a free flush of the
-** clock when shutting down. The EEPROM is only written if it changes so we should
-** be ok....maybe....hopefully....
-*/
+/* Dirty flag, set whenever shadow registers are written */
 static volatile bool bShadowDirty;
+
+/*
+** Last write time, snapshot of uiSeconds counter above, taken when a write command is issued.
+** uiWriteTimeoutSecs after the last write is issued the shadow will be persisted to EEPROM
+*/
+static volatile uint8_t uiLastWriteSecs;
 
 #endif
 
 /* Write protection status */
-static bool bWriteProtected = true;
+static bool bWriteProtected = false;
 
 /* Seconds counter */
 static volatile uSeconds_t uSeconds;
@@ -311,14 +322,18 @@ int main(void)
 	/* Enable interrupts */
 	sei();
 
+#ifdef ENABLE_EEPROM
 	/* Sleep whenever possible, updating EEPROM if dirty, writing clock periodically */
-	uint32_t uiLastSeconds = snapshotSeconds();
+	uint8_t uiLastTimeWriteSecs = uiSeconds;
+#endif
 	for (;;)
 	{
 #ifdef ENABLE_EEPROM
-		uint32_t uiCurrSeconds = snapshotSeconds();
+		uint8_t uiCurrSecs = uiSeconds;
 
-		if (bShadowDirty)
+		if (   bShadowDirty
+			&& ((uiCurrSecs - uiLastWriteSecs) >= uiWriteTimeoutSecs)
+		   )
 		{
 			/* Clear dirty flag first in case its set again */
 			bShadowDirty = false;
@@ -327,13 +342,13 @@ int main(void)
 			eeprom_update_block(abyPRAMShadow, abyPRAM, sizeof(abyPRAMShadow));
 		}
 
-		if ((uiCurrSeconds - uiLastSeconds) >= uiSaveClockEverySecs)
+		if ((uiCurrSecs - uiLastTimeWriteSecs) >= uiSaveClockEverySecs)
 		{
 			/* Update last clock write time */
-			uiLastSeconds = uiCurrSeconds;
+			uiLastTimeWriteSecs = uiCurrSecs;
 
 			/* Update clock in EEPROM from RAM */
-			eeprom_update_dword(&uiStoredSeconds, uiCurrSeconds);
+			eeprom_update_dword(&uiStoredSeconds, snapshotSeconds());
 		}
 #endif
 
@@ -363,6 +378,9 @@ ISR(TIM0_COMPA_vect, ISR_NOBLOCK)
 			cli();
 			uSeconds.uiValue++;
 			sei();
+#ifdef ENABLE_EEPROM
+			uiSeconds++;
+#endif
 		}
 
 		/* Decrement counter */
@@ -551,6 +569,7 @@ static void timerInit(void)
 	TIMSK |= _BV(OCIE0A);
 }
 
+#ifdef ENABLE_EEPROM
 static uint32_t snapshotSeconds(void)
 {
 	uint32_t uiSnapshot;
@@ -563,6 +582,7 @@ static uint32_t snapshotSeconds(void)
 
 	return uiSnapshot;
 }
+#endif
 
 static inline uint8_t processRegularCmdRead(uint8_t uiAddrBase)
 {
@@ -631,11 +651,6 @@ static inline void processRegularCmdWrite(uint8_t uiAddrBase, uint8_t uiData)
 		/* Extract new write protect status */
 		bool bNewWriteProtected = mDataByteToWriteProtect(uiData);
 
-#ifdef ENABLE_EEPROM
-		/* Set dirty flag when transitioning from read-write to read-only */
-		if (!bWriteProtected && bNewWriteProtected) bShadowDirty = true;
-#endif
-
 		/* Update write protect flag */
 		bWriteProtected = bNewWriteProtected;
 	}
@@ -645,6 +660,12 @@ static inline void processRegularCmdWrite(uint8_t uiAddrBase, uint8_t uiData)
 	{
 		/* RAM address is within classic low or high range, which maps directly into extended range, store byte */
 		abyPRAMShadow[uiFullAddr] = uiData;
+
+#ifdef ENABLE_EEPROM
+		/* Flag shadow dity, updating last write time */
+		bShadowDirty = true;
+		uiLastWriteSecs = uiSeconds;
+#endif
 	}
 }
 
@@ -667,4 +688,10 @@ static inline void processExtendedCmdWrite(uint8_t uiAddrBase, uint8_t uiAddrExt
 
 	/* Store data */
 	abyPRAMShadow[uiFullAddr] = uiData;
+
+#ifdef ENABLE_EEPROM
+	/* Flag shadow dity, updating last write time */
+	bShadowDirty = true;
+	uiLastWriteSecs = uiSeconds;
+#endif
 }
